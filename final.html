@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Data Wiper - Touchless Interface</title>
+  <meta name="description" content="A touchless web navigation experiment using computer vision and digital rain aesthetics.">
+  
+  <!-- Libraries -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.7.0/p5.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      font-family: monospace;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <script>
+    let videoElement;
+    let canvasElement;
+    let canvasCtx;
+    let hands;
+    let camera;
+  // Offscreen vignette buffer
+  let vignetteGfx = null;
+  // Reusable color palette
+  const PALETTE = ['#2b4539', '#61dca3', '#61b3dc'];
+    
+    // Audio Context
+    let audioCtx;
+    
+    // Global state
+    let handDetected = false;
+    let handX = 0;
+    let handY = 0;
+    let handOpenness = 0; // 0 = fist, 1 = open palm
+    let currentLandmarks = null;
+    
+    // Letter grid
+    let letters = [];
+    let charWidth = 14;
+    let charHeight = 20;
+    let columns, rows;
+    
+    // Interaction
+    let wipeRadius = 100;
+    
+    // Resume audio context on any click (browser policy fix)
+    window.addEventListener('click', () => {
+      if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+    });
+
+    // Sound generator function
+    function playTechSound(type) {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+
+      const osc = audioCtx.createOscillator();
+      const gainNode = audioCtx.createGain();
+      
+      osc.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      
+      const now = audioCtx.currentTime;
+      
+      // "Ouch" / Yelp sounds
+      if (type === 'high') {
+        // High pitched "Ouch!"
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(800, now);
+        osc.frequency.exponentialRampToValueAtTime(300, now + 0.25);
+        
+        gainNode.gain.setValueAtTime(0, now);
+        gainNode.gain.linearRampToValueAtTime(0.3, now + 0.05);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+        
+        osc.start(now);
+        osc.stop(now + 0.3);
+        
+      } else if (type === 'low') {
+        // Grunt / Low "Oof!"
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(400, now);
+        osc.frequency.linearRampToValueAtTime(150, now + 0.2);
+        
+        gainNode.gain.setValueAtTime(0, now);
+        gainNode.gain.linearRampToValueAtTime(0.4, now + 0.02);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
+        
+        osc.start(now);
+        osc.stop(now + 0.25);
+        
+      } else if (type === 'coin') {
+        // Sharp "Ah!"
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(600, now);
+        osc.frequency.exponentialRampToValueAtTime(400, now + 0.15);
+        
+        gainNode.gain.setValueAtTime(0, now);
+        gainNode.gain.linearRampToValueAtTime(0.2, now + 0.02);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+        
+        osc.start(now);
+        osc.stop(now + 0.2);
+      }
+    }
+
+    let links = [
+      { 
+        text: "GRAB", 
+        x: 0, y: 0, 
+        revealed: 0, 
+        action: () => { console.log("Grab Clicked"); playTechSound('high'); }, 
+        flashing: false,
+        cooldown: 0 
+      },
+      { 
+        text: "SNATCH", 
+        x: 0, y: 0, 
+        revealed: 0, 
+        action: () => { console.log("Snatch Clicked"); playTechSound('low'); }, 
+        flashing: false,
+        cooldown: 0
+      },
+      { 
+        text: "CLUTCH", 
+        x: 0, y: 0, 
+        revealed: 0, 
+        action: () => { console.log("Clutch Clicked"); playTechSound('coin'); }, 
+        flashing: false,
+        cooldown: 0
+      }
+    ];
+    
+    function setup() {
+      // Create main canvas
+      createCanvas(windowWidth, windowHeight);
+      background(0);
+
+      // Text baseline + smoothing for glyph layout
+      textFont('monospace');
+      textSize(16);
+      textAlign(LEFT, TOP);
+
+      // Initialize letters grid and links
+      initializeLetters();
+      positionLinks();
+
+      // Pre-render vignette to an offscreen buffer for performance
+      vignetteGfx = createGraphics(width, height);
+      renderVignetteToBuffer();
+
+      // Setup MediaPipe Hands
+      videoElement = createVideoElement();
+
+      hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+      }});
+
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7
+      });
+
+      hands.onResults(onHandResults);
+
+      // Setup Camera - MediaPipe Camera will manage stream
+      camera = new Camera(videoElement, {
+        onFrame: async () => {
+          await hands.send({image: videoElement});
+        },
+        width: 640,
+        height: 480
+      });
+
+      camera.start()
+        .catch(err => console.error("Camera Error: " + err));
+
+      // Create audio context eagerly (will be resumed on first interaction if suspended)
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      } catch (e) {
+        console.warn('AudioContext not available:', e);
+      }
+    }
+
+    function draw() {
+      background(10, 20); // Slight trail effect
+
+      updateLetters();
+      drawLetters();
+
+      // Fast: draw pre-rendered vignette
+      if (vignetteGfx) image(vignetteGfx, 0, 0);
+
+      // Draw hand BEFORE links so links appear on top of the black silhouette
+      drawHandIndicator();
+      drawLinks();
+    }
+    
+    function onHandResults(results) {
+      if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        handDetected = true;
+        const landmarks = results.multiHandLandmarks[0];
+        currentLandmarks = landmarks;
+        
+        // Calculate hand center (approximate using wrist and middle finger base)
+        const wrist = landmarks[0];
+        const middleBase = landmarks[9];
+        
+        // Mirror X coordinate for intuitive interaction
+        handX = 1 - (wrist.x + middleBase.x) / 2;
+        handY = (wrist.y + middleBase.y) / 2;
+        
+        // Calculate openness (distance between wrist and finger tips)
+        const tips = [4, 8, 12, 16, 20];
+        let totalDist = 0;
+        tips.forEach(idx => {
+          totalDist += dist(wrist.x, wrist.y, landmarks[idx].x, landmarks[idx].y);
+        });
+        
+        // Normalize openness (approximate range based on testing)
+        handOpenness = map(totalDist, 0.8, 1.8, 0, 1, true);
+        
+      } else {
+        handDetected = false;
+        currentLandmarks = null;
+      }
+    }
+
+    function createVideoElement() {
+      // MediaPipe Camera prefers an actual HTMLVideoElement with autoplay/playsinline
+      const vid = document.createElement('video');
+      vid.style.display = 'none';
+      vid.setAttribute('playsinline', '');
+      vid.setAttribute('autoplay', '');
+      vid.muted = true; // Allow autoplay on many browsers
+      vid.width = 640;
+      vid.height = 480;
+      document.body.appendChild(vid);
+      return vid;
+    }
+    
+    function getRandomChar() {
+      const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$&*()";
+      return chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    
+    function getRandomColor() {
+      // Return a p5.Color from the palette
+      return color(PALETTE[Math.floor(Math.random() * PALETTE.length)]);
+    }
+
+    function initializeLetters() {
+      columns = Math.ceil(width / charWidth);
+      rows = Math.ceil(height / charHeight);
+      letters = [];
+      
+      for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < columns; x++) {
+          letters.push({
+            char: getRandomChar(),
+            x: x * charWidth,
+            y: y * charHeight,
+            color: getRandomColor(),
+            targetColor: getRandomColor(),
+            colorProgress: 0,
+            transparent: 0
+          });
+        }
+      }
+    }
+    
+    function positionLinks() {
+      // Minimum distance between links (pixels) to prevent overlapping
+      const minDistance = 300;
+      const marginPx = 100; // 100px safety margin from borders
+      
+      // Convert pixel margin to column/row count to ensure we stay on grid
+      const marginCols = Math.ceil(marginPx / charWidth);
+      const marginRows = Math.ceil(marginPx / charHeight);
+      
+      links.forEach((link, index) => {
+        let validPosition = false;
+        let attempts = 0;
+        
+        while (!validPosition && attempts < 100) {
+          attempts++;
+          
+          // Ensure enough space for text length + margins
+          const textLen = link.text.length;
+          
+          // Random column between margins
+          const randomCol = Math.floor(random(marginCols, columns - textLen - marginCols));
+          const randomRow = Math.floor(random(marginRows, rows - marginRows));
+          
+          const candidateX = randomCol * charWidth;
+          const candidateY = randomRow * charHeight;
+          
+          // Check distance against already placed links
+          let overlap = false;
+          for (let i = 0; i < index; i++) {
+            const other = links[i];
+            const d = dist(candidateX, candidateY, other.x, other.y);
+            if (d < minDistance) {
+              overlap = true;
+              break;
+            }
+          }
+          
+          if (!overlap) {
+            link.x = candidateX;
+            link.y = candidateY;
+            validPosition = true;
+          }
+        }
+        
+        // Fallback if placement failed
+        if (!validPosition) {
+           link.x = (width/2) - ((links.length * 100)/2) + (index * 200);
+           link.y = height/2;
+        }
+      });
+    }
+
+    function drawLetters() {
+      noStroke();
+      textFont('monospace');
+      textSize(16);
+      
+      letters.forEach(l => {
+        // Calculate distance to hand for wiping effect
+        if (handDetected && handOpenness > 0.5) {
+          const hx = handX * width;
+          const hy = handY * height;
+          const d = dist(hx, hy, l.x, l.y);
+          
+          if (d < wipeRadius) {
+            l.transparent = 1; // Fully transparent
+          }
+        }
+        
+        // Decay transparency
+        if (l.transparent > 0) {
+          l.transparent -= 0.02;
+        }
+        
+        // Draw if not fully transparent
+        if (l.transparent < 1) {
+          const c = l.color;
+          // Alpha based on transparency
+          const alphaVal = 255 * (1 - l.transparent);
+          
+          if (alphaVal > 10) {
+            c.setAlpha(alphaVal);
+            fill(c);
+            text(l.char, l.x, l.y);
+          }
+        }
+      });
+    }
+    
+    function updateLetters() {
+      // Only update a small fraction per frame to create the rain effect
+      const updateCount = Math.max(1, Math.floor(letters.length * 0.03));
+      for (let i = 0; i < updateCount; i++) {
+        const index = Math.floor(Math.random() * letters.length);
+        const letter = letters[index];
+        letter.char = getRandomChar();
+        // Replace color immediately (cheap) - could animate later
+        letter.color = getRandomColor();
+      }
+    }
+
+    // Pre-render vignette into an offscreen buffer for speed
+    function renderVignetteToBuffer() {
+      if (!vignetteGfx) vignetteGfx = createGraphics(width, height);
+      vignetteGfx.clear();
+      vignetteGfx.noStroke();
+      const cx = width / 2;
+      const cy = height / 2;
+      const maxDist = Math.sqrt(cx * cx + cy * cy);
+
+      const tile = 40;
+      for (let y = 0; y < height; y += tile) {
+        for (let x = 0; x < width; x += tile) {
+          const dx = x - cx;
+          const dy = y - cy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d > maxDist * 0.5) {
+            const vignetteStrength = map(d, maxDist * 0.5, maxDist, 0, 200);
+            vignetteGfx.fill(0, vignetteStrength);
+            vignetteGfx.rect(x, y, tile, tile);
+          }
+        }
+      }
+    }
+
+    function drawLinks() {
+      links.forEach(link => {
+        // Reduce cooldown
+        if (link.cooldown > 0) link.cooldown--;
+
+        let isWiping = false;
+
+        // Update reveal based on hand proximity
+        if (handDetected && handOpenness > 0.5) {
+          const hx = handX * width;
+          const hy = handY * height;
+          
+          const linkCenterX = link.x + (link.text.length * charWidth) / 2;
+          const linkCenterY = link.y + charHeight / 2;
+          
+          const distance = dist(hx, hy, linkCenterX, linkCenterY);
+          
+          if (distance < wipeRadius) {
+            link.revealed = min(1, link.revealed + 0.1); 
+            isWiping = true;
+          }
+        }
+        
+        // Decay the reveal if not currently being wiped
+        if (!isWiping && link.revealed > 0) {
+            link.revealed = max(0, link.revealed - 0.02);
+        }
+        
+        // Draw the link text if revealed
+        if (link.revealed > 0) {
+          push();
+          
+          // Check if hand is over this link
+          const hx = handX * width;
+          const hy = handY * height;
+          const isHovering = handDetected && 
+                            hx >= link.x && 
+                            hx <= link.x + link.text.length * charWidth &&
+                            hy >= link.y && 
+                            hy <= link.y + charHeight;
+          
+          // Color based on state
+          let linkColor;
+          if (link.flashing) {
+            linkColor = color('#ffffff');
+          } else if (isHovering && handOpenness < 0.4 && link.revealed > 0.5) {
+            // Ready to click - bright cyan
+            linkColor = color('#61dca3');
+          } else if (isHovering) {
+            // Hovering but not fist - lighter blue
+            linkColor = color('#61b3dc');
+          } else {
+            // Default - green
+            linkColor = color('#61dca3');
+          }
+          
+          linkColor.setAlpha(255 * link.revealed);
+          
+          fill(linkColor);
+          noStroke();
+          
+          // Draw each character
+          for (let i = 0; i < link.text.length; i++) {
+            const charX = link.x + i * charWidth;
+            text(link.text[i], charX, link.y);
+          }
+          
+          // Draw clickable indicator if ready
+          if (isHovering && handOpenness < 0.4 && link.revealed > 0.5) {
+            noFill();
+            stroke(linkColor);
+            strokeWeight(2);
+            rect(link.x - 5, link.y - 5, link.text.length * charWidth + 10, charHeight + 10);
+            
+            // Trigger action (with cooldown)
+            if (link.cooldown <= 0) {
+                link.action();
+                link.flashing = true;
+                link.cooldown = 60; // 1 second cooldown
+                setTimeout(() => link.flashing = false, 200);
+            }
+          }
+          
+          pop();
+        }
+      });
+    }
+
+    function drawHandIndicator() {
+      if (!currentLandmarks) return;
+
+      push();
+      noStroke();
+      fill(0); // Solid black
+
+      const lm = currentLandmarks;
+      const getX = (idx) => (1 - lm[idx].x) * width;
+      const getY = (idx) => lm[idx].y * height;
+      
+      // Helper to draw a segment between two points
+      const drawSegment = (idx1, idx2, thickness) => {
+        const x1 = getX(idx1);
+        const y1 = getY(idx1);
+        const x2 = getX(idx2);
+        const y2 = getY(idx2);
+        
+        // Draw circle at joints
+        circle(x1, y1, thickness);
+        circle(x2, y2, thickness);
+        
+        // Draw rect connecting them
+        const angle = atan2(y2 - y1, x2 - x1);
+        const distVal = dist(x1, y1, x2, y2);
+        
+        push();
+        translate(x1, y1);
+        rotate(angle);
+        rect(0, -thickness/2, distVal, thickness);
+        pop();
+      };
+
+      // Fill the palm area
+      beginShape();
+      vertex(getX(0), getY(0));   // Wrist
+      vertex(getX(1), getY(1));   // Thumb CMC
+      vertex(getX(5), getY(5));   // Index MCP
+      vertex(getX(9), getY(9));   // Middle MCP
+      vertex(getX(13), getY(13)); // Ring MCP
+      vertex(getX(17), getY(17)); // Pinky MCP
+      endShape(CLOSE);
+
+      // Draw Palm (Connections between bases)
+      const palmThickness = 24;
+      drawSegment(0, 1, palmThickness);
+      drawSegment(1, 5, palmThickness);
+      drawSegment(5, 9, palmThickness);
+      drawSegment(9, 13, palmThickness);
+      drawSegment(13, 17, palmThickness);
+      drawSegment(17, 0, palmThickness);
+      
+      // Draw Fingers
+      const fingerThickness = 20;
+      
+      // Thumb
+      drawSegment(1, 2, fingerThickness);
+      drawSegment(2, 3, fingerThickness);
+      drawSegment(3, 4, fingerThickness);
+      
+      // Index
+      drawSegment(5, 6, fingerThickness);
+      drawSegment(6, 7, fingerThickness);
+      drawSegment(7, 8, fingerThickness);
+      
+      // Middle
+      drawSegment(9, 10, fingerThickness);
+      drawSegment(10, 11, fingerThickness);
+      drawSegment(11, 12, fingerThickness);
+      
+      // Ring
+      drawSegment(13, 14, fingerThickness);
+      drawSegment(14, 15, fingerThickness);
+      drawSegment(15, 16, fingerThickness);
+      
+      // Pinky
+      drawSegment(17, 18, fingerThickness);
+      drawSegment(18, 19, fingerThickness);
+      drawSegment(19, 20, fingerThickness);
+
+      pop();
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      initializeLetters();
+      positionLinks();
+      // Recreate and re-render vignette buffer at new size
+      vignetteGfx = createGraphics(width, height);
+      renderVignetteToBuffer();
+    }
+  </script>
+</body>
+</html>
